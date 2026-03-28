@@ -1,0 +1,36 @@
+{
+  "name": "claude-voice",
+  "version": "1.0.0",
+  "description": "Voice integration for Claude Code — TTS, push-to-talk STT, multi-instance audio, overlay UI (Windows only)",
+  "author": {
+    "name": "astmo"
+  },
+  "license": "MIT",
+  "keywords": ["voice", "tts", "stt", "audio", "speech"],
+  "commands": "./commands",
+  "hooks": "./hooks/hooks.json",
+  "userConfig": {
+    "ttsBackend": {
+      "type": "select",
+      "description": "Text-to-speech backend",
+      "options": ["edge", "kokoro", "elevenlabs"],
+      "default": "edge"
+    },
+    "elevenlabsApiKey": {
+      "type": "string",
+      "description": "ElevenLabs API key (only needed if using elevenlabs backend)",
+      "sensitive": true,
+      "default": ""
+    },
+    "pttKey": {
+      "type": "string",
+      "description": "Push-to-talk key(s), comma-separated",
+      "default": "page down,insert"
+    },
+    "muteKey": {
+      "type": "string",
+      "description": "Key to toggle mute",
+      "default": "page up"
+    }
+  }
+}

@@ -1,0 +1,11 @@
+# Core dependencies
+numpy
+sounddevice
+faster-whisper
+edge-tts
+miniaudio
+keyboard
+requests
+
+# Optional: for Kokoro TTS backend (install with /voice-setup-kokoro)
+# kokoro-onnx

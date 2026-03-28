@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+.voice_registry.json
+*.onnx
+*.bin
+plan.md
