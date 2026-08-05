@@ -7,5 +7,10 @@ miniaudio
 keyboard
 requests
 
+# Recommended: lets the hook identify the real claude.exe process, so a session
+# is pruned when Claude exits rather than when its shell does. Falls back to the
+# parent PID if absent.
+psutil
+
 # Optional: for Kokoro TTS backend (install with /voice-setup-kokoro)
 # kokoro-onnx

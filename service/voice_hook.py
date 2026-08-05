@@ -53,6 +53,39 @@ def _get_hwnd():
         return 0
 
 
+def _find_claude_pid():
+    """Walk up the process tree looking for a claude.exe ancestor.
+
+    Hook events fire as: claude.exe -> cmd.exe -> python voice_hook.py
+    (Claude Code shells out to run the hook command.) So claude.exe is an
+    ancestor, not the direct parent. The intermediate cmd.exe is short-lived
+    and must not be stored as the tracking PID, or prune will drop the
+    instance the moment that shell exits.
+
+    Returns 0 if no claude.exe ancestor is found, or if psutil isn't
+    installed — callers fall back to the parent PID.
+    """
+    try:
+        import psutil
+    except ImportError:
+        return 0  # optional dependency; fall back to parent PID
+    try:
+        node = psutil.Process().parent()
+        # Limit depth so a weird process tree can't hang the hook.
+        for _ in range(8):
+            if node is None:
+                return 0
+            try:
+                if node.name().lower() == "claude.exe":
+                    return node.pid
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                return 0
+            node = node.parent()
+    except Exception:
+        pass
+    return 0
+
+
 def forward():
     """Read hook event JSON from stdin, enrich with metadata, forward to service."""
     port = _get_port()
@@ -76,8 +109,13 @@ def forward():
             hwnd = _get_hwnd()
             if hwnd:
                 event["_instance_hwnd"] = hwnd
-            ppid = os.getppid() if hasattr(os, "getppid") else os.getpid()
-            event["_instance_pid"] = ppid
+            # Send the real claude.exe PID so prune detects when Claude exits
+            # even if the terminal window stays open. Falls back to the parent
+            # cmd.exe PID when claude.exe can't be located.
+            claude_pid = _find_claude_pid()
+            if not claude_pid:
+                claude_pid = os.getppid() if hasattr(os, "getppid") else os.getpid()
+            event["_instance_pid"] = claude_pid
             data = json.dumps(event).encode("utf-8")
         except (json.JSONDecodeError, Exception):
             pass  # forward raw if enrichment fails

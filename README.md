@@ -12,6 +12,49 @@ Voice integration plugin for Claude Code. Adds text-to-speech narration, push-to
 - **Multi-instance** — Multiple Claude sessions share one audio service; click the overlay to switch
 - **Overlay UI** — Always-on-top window showing state, instances, device selection
 - **Three TTS backends** — Edge (default, free), Kokoro (local, high quality), ElevenLabs (premium API)
+- **Separate voices, separately mutable** — responses and tool announcements use
+  different voices on different channels, so you can silence the tool announcer
+  and keep hearing the replies
+- **Skip a sentence** — jump to the next sentence without dropping the rest of the response
+- **Listen-only mode** — `--voice-out` gives TTS with no mic, skipping the STT model load entirely
+- **Secret tripwire** (opt-in) — watches transcripts for real secret *values* being
+  emitted raw, and raises a persistent alarm panel if one leaks
+
+## Controls
+
+| Key | Action |
+| --- | --- |
+| `Page Down` / `Insert` | Push-to-talk (hold) |
+| `Page Up` | Mute / unmute |
+| `Scroll Lock` | Pause / resume playback |
+| `Ctrl+Shift+.` | Skip the current sentence |
+| `Ctrl+Shift+N` | Toggle the tool-announcer voice |
+| `Ctrl+Shift+J` | Toggle the spoken security alarm |
+| `Ctrl+End` | Quit the service |
+| `Ctrl+\` | Relaunch the overlay |
+
+The overlay also has 🗣 and 🔔 buttons for the two toggles. All keys are
+rebindable — see `--narrate-key`, `--alarm-key`, `--skip-key`, etc.
+
+## Secret tripwire (optional)
+
+Off by default. Point it at a `KEY=VALUE` file to enable:
+
+```
+set CLAUDE_VOICE_SECRETS=C:\path\to\secrets.env
+```
+
+It then scans each transcript delta for those **values**. A secret's *name*
+appearing is fine; the *value* appearing means it was handled raw, and that
+fires the alarm: a stderr log line, a durable record, and a red panel in the
+overlay naming the agent and the secret.
+
+Only **names** are ever logged, stored, or displayed — never the value itself,
+since writing the value down would be the leak it is trying to catch.
+
+`Ctrl+Shift+J` (or the 🔔 button) silences only the *spoken* alarm. The log
+line, the durable record, and the visual panel always fire, so muting the
+speaker can never hide that a secret leaked.
 
 ## Install
 

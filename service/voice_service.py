@@ -42,6 +42,11 @@ from audio_utils import (
     MIXER_SR, make_startup_chime, make_beep, make_tool_tone, make_result_chime,
 )
 
+# Optional secret tripwire. Inert unless CLAUDE_VOICE_SECRETS points at a
+# KEY=VALUE file (see secret_alarm.py), so it costs nothing by default.
+from secret_alarm import SecretAlarm
+import secret_alarm as secret_alarm_store
+
 
 # ── Data directory ────────────────────────────────────────────
 # Use CLAUDE_PLUGIN_DATA if available (set by Claude Code plugin system),
@@ -613,6 +618,10 @@ class Instance:
         self._stop_lock = threading.Lock()
         self._transcript_size_at_stop = 0
         self.active = False
+        self._primed = False
+        # Byte offset up to which the secret tripwire has already scanned the
+        # transcript, so each scan only covers new content.
+        self._scan_offset = 0
 
 
 REGISTRY_FILE = os.path.join(PLUGIN_DATA, ".voice_registry.json")
@@ -683,13 +692,26 @@ class InstanceRegistry:
             return True
         if sys.platform == "win32":
             import ctypes
+            import ctypes.wintypes
             PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-            h = ctypes.windll.kernel32.OpenProcess(
+            STILL_ACTIVE = 259
+            k32 = ctypes.windll.kernel32
+            h = k32.OpenProcess(
                 PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-            if h:
-                ctypes.windll.kernel32.CloseHandle(h)
-                return True
-            return False
+            if not h:
+                return False
+            try:
+                # OpenProcess alone is NOT enough: it still succeeds for a
+                # *zombie* — a process that has exited but whose PID entry is
+                # kept alive by an outstanding handle. Such entries would
+                # otherwise linger in the instance list forever. Only a
+                # STILL_ACTIVE exit code means genuinely running.
+                code = ctypes.wintypes.DWORD()
+                if not k32.GetExitCodeProcess(h, ctypes.byref(code)):
+                    return True  # can't tell — assume alive, don't drop it
+                return code.value == STILL_ACTIVE
+            finally:
+                k32.CloseHandle(h)
         else:
             try:
                 os.kill(pid, 0)
@@ -1018,6 +1040,27 @@ class OverlayNotifier:
     def error(self, message):
         self.send(state="error", message=message)
 
+    def skipped(self, did_skip=True):
+        """Flash a 'skipped' indicator. did_skip=False means nothing was
+        playing/queued, so the keypress registered but had nothing to skip."""
+        self.send(state="skipped", did_skip=did_skip)
+
+    def narrate(self, is_on):
+        """Tool narration turned on/off. Distinct from mute: response speech
+        keeps playing either way."""
+        self.send(state="narrate", narrate=is_on)
+
+    def alarm_voice(self, is_on):
+        """Spoken security alarm turned on/off. The incident panel and the
+        durable record are unaffected — only the speech is silenced."""
+        self.send(state="alarm_voice", alarm_voice=is_on)
+
+    def alarm_panel(self, incidents):
+        """Persistent per-incident security panel. `incidents` is a list of
+        {id, names, instance, when} dicts, newest first. Empty list = none.
+        Not cleared by other states; only explicit acknowledgement empties it."""
+        self.send(state="alarm_panel", incidents=incidents)
+
     def loading(self, model):
         self.send(state="loading", model=model)
 
@@ -1033,9 +1076,11 @@ class OverlayNotifier:
     def instances(self, instance_list):
         self.send(state="instances", instances=instance_list)
 
-    def init(self, backend, key, devices=None, cmd_port=0):
+    def init(self, backend, key, devices=None, cmd_port=0, narrate=True,
+             alarm_voice=True):
         self.send(state="init", backend=backend, key=key,
-                  devices=devices or {}, cmd_port=cmd_port)
+                  devices=devices or {}, cmd_port=cmd_port, narrate=narrate,
+                  alarm_voice=alarm_voice)
 
 
 _overlay: OverlayNotifier | None = None
@@ -1052,15 +1097,25 @@ class EventHandler:
     """Handles hook events from all Claude instances."""
 
     def __init__(self, mixer, registry, backend="edge",
-                 narrate_tools=True, voice_enabled=True):
+                 narrate_tools=True, voice_enabled=True, alarm_voice=True):
         self.mixer = mixer
         self.registry = registry
         self.backend = backend
         self.narrate_tools = narrate_tools
         self.voice_enabled = voice_enabled
+        # Gates ONLY the spoken security alarm. The log line, the durable
+        # record and the visual panel are never silenced — muting the speaker
+        # must not be able to hide that a secret leaked.
+        self.alarm_voice = alarm_voice
+
+        # Secret tripwire: scans transcript deltas for any real secret VALUE.
+        # Optional — degrades to "no scan" when no secret source is configured.
+        self._secret_alarm = SecretAlarm()
+        self._alarm_lock = threading.Lock()
 
         self._tts_q = queue.Queue()
-        self._tts_cancelled = threading.Event()
+        self._tts_cancelled = threading.Event()  # cancel whole item + drain
+        self._tts_skip = threading.Event()       # skip ONE sentence, keep going
         self._tts_paused = threading.Event()
         self._tts_worker = threading.Thread(target=self._tts_loop, daemon=True)
         self._tts_worker.start()
@@ -1068,6 +1123,53 @@ class EventHandler:
         self._narrate_q = queue.Queue()
         self._narrate_worker = threading.Thread(target=self._narrate_loop, daemon=True)
         self._narrate_worker.start()
+
+    def set_narrate_tools(self, enabled):
+        """Turn tool narration (the announcer voice) on/off at runtime.
+
+        Independent of response speech: the 'voice' channel is untouched, so
+        turning narration off leaves responses reading normally. Turning it off
+        also drops queued narration and silences the 'tools' channel so an
+        in-flight announcement stops immediately rather than finishing.
+        """
+        self.narrate_tools = bool(enabled)
+        if not self.narrate_tools:
+            while not self._narrate_q.empty():
+                try:
+                    self._narrate_q.get_nowait()
+                except queue.Empty:
+                    break
+            try:
+                self.mixer.reset_channel("tools")
+            except Exception:
+                pass
+        return self.narrate_tools
+
+    def set_alarm_voice(self, enabled):
+        """Turn the SPOKEN security alarm on/off at runtime.
+
+        Only the speech is affected: the stderr log line, the durable alarm
+        record and the overlay's incident panel still fire, so a leak is never
+        silently missed — it just stops shouting.
+        """
+        self.alarm_voice = bool(enabled)
+        return self.alarm_voice
+
+    def skip_current(self):
+        """Skip the currently-playing SENTENCE and advance to the next one
+        WITHOUT draining the queue (that's mute/_kill_all_audio).
+
+        Uses a dedicated _tts_skip flag (NOT _tts_cancelled, which would
+        abandon the entire remaining response).
+        """
+        if not (self.mixer.is_playing("voice") or not self._tts_q.empty()):
+            return False
+        self._tts_skip.set()
+        if self._tts_paused.is_set():
+            self._tts_paused.clear()
+            self.mixer.unpause("voice")
+        self._fade_and_clear_voice(fade_secs=0.3)
+        return True
 
     def _fade_and_clear_voice(self, fade_secs=0.5):
         if self.mixer.is_playing("voice"):
@@ -1090,8 +1192,9 @@ class EventHandler:
             time.sleep(0.05)
 
     def _wait_channel_pausable(self, name):
+        """Like mixer.wait_channel but respects pause, cancel, and skip."""
         while self.mixer.channels[name].has_data():
-            if self._tts_cancelled.is_set():
+            if self._tts_cancelled.is_set() or self._tts_skip.is_set():
                 return
             time.sleep(0.03)
 
@@ -1106,6 +1209,7 @@ class EventHandler:
                 continue
             try:
                 self._tts_cancelled.clear()
+                self._tts_skip.clear()
                 if is_final:
                     sentences = text_or_list if isinstance(text_or_list, list) else [text_or_list]
                     for sentence in sentences:
@@ -1122,7 +1226,12 @@ class EventHandler:
                             break
                         self._fade_and_clear_voice(fade_secs=0.5)
                         self.mixer.play("voice", audio, sr=sr)
+                        # Returns early if skip OR cancel is set. On skip, clear
+                        # the flag and fall through to the next sentence (the
+                        # crossfade out was already done by skip_current()).
                         self._wait_channel_pausable("voice")
+                        if self._tts_skip.is_set():
+                            self._tts_skip.clear()
                 else:
                     text = text_or_list if isinstance(text_or_list, str) else " ".join(text_or_list)
                     text = text.strip()
@@ -1141,6 +1250,10 @@ class EventHandler:
         """Tool narration worker — uses kokoro (male voice) if available, else edge."""
         while True:
             narration = self._narrate_q.get()
+            # Re-check at dequeue time: narration may have been toggled off
+            # while this item sat in the queue or while TTS was generating.
+            if not self.narrate_tools:
+                continue
             try:
                 try:
                     audio, sr = generate_kokoro(narration, voice="am_michael")
@@ -1164,6 +1277,21 @@ class EventHandler:
         if was_new and broadcast_fn:
             print(f"  ~ Linked: {inst.name} -> session {session_id[:8]} (muted={inst.muted})")
             broadcast_fn()
+
+        # Prime the tripwire's scan offset on first sight of a session so a
+        # resumed session's PRIOR transcript isn't retro-scanned and alarmed.
+        if not inst._primed:
+            tp = event.get("transcript_path", "")
+            if tp:
+                try:
+                    inst._scan_offset = os.path.getsize(tp)
+                except OSError:
+                    inst._scan_offset = 0
+            inst._primed = True
+
+        # Secret tripwire — scan the transcript delta on every event. Runs
+        # regardless of mute (a leak matters even on a muted instance).
+        self._scan_for_secrets(event, inst)
 
         if hook == "PreToolUse":
             if not inst.active:
@@ -1283,6 +1411,84 @@ class EventHandler:
 
         self.mixer.play("effects", make_result_chime())
 
+    def _scan_for_secrets(self, event, inst):
+        """Scan the transcript delta for leaked secret VALUES; alarm on a hit.
+
+        Runs on every handled event. Cheap: scans only bytes added since the
+        last scan. A hit means a secret was emitted raw (not by name).
+
+        Opt-in: with no secret source configured this is a no-op, so the
+        plugin behaves exactly as before for users who don't use it.
+        """
+        path = event.get("transcript_path", "")
+        if not path:
+            return
+        try:
+            with self._alarm_lock:
+                hits, new_off = self._secret_alarm.scan_transcript_tail(
+                    path, inst._scan_offset)
+                inst._scan_offset = new_off
+            if hits:
+                self._fire_secret_alarm(hits, inst)
+        except Exception as exc:
+            # Never let the tripwire disturb the service.
+            sys.stderr.write(f"[secret-alarm scan error: {exc}]\n")
+
+    def _fire_secret_alarm(self, names, inst):
+        """A secret VALUE was found in the transcript. Alert by UI + voice.
+
+        Reports NAMES only, never values. Bypasses mute so the alert is heard
+        regardless of which instance is unmuted.
+        """
+        joined = ", ".join(names)
+        # 1) Hard log line (deterministic record).
+        sys.stderr.write(
+            f"\n*** SECRET ALARM *** value(s) for [{joined}] found in "
+            f"transcript of '{inst.name}' — rotate immediately ***\n")
+        # 2) Durable record — survives restart, persists until acknowledged.
+        try:
+            secret_alarm_store.record_alarm(names, inst.name, when=time.time())
+        except Exception:
+            pass
+        # 3) Visual: push the full per-incident panel.
+        overlay = _get_overlay()
+        if overlay:
+            self._push_alarm_panel(overlay)
+        # 4) Audible — suppressible. The incident is already logged, recorded
+        #    and shown above, so silencing the speaker loses no evidence.
+        if not self.alarm_voice:
+            return
+        try:
+            n = len(names)
+            spoken = (f"Security alarm. {n} secret value"
+                      f"{'s' if n != 1 else ''} exposed in transcript. "
+                      f"{joined.replace('_', ' ').lower()}.")
+            audio, sr = self._generate_tts(spoken)
+            self.mixer.play("voice", audio, sr=sr)
+        except Exception as exc:
+            sys.stderr.write(f"[secret-alarm voice error: {exc}]\n")
+            self.mixer.play("effects", make_beep())
+
+    def _push_alarm_panel(self, overlay):
+        """Send the full per-incident alarm list to the overlay (newest first).
+
+        Sends NAMES + instance + timestamp + stable id — never values.
+        """
+        try:
+            active = secret_alarm_store.active_alarms()
+        except Exception:
+            active = []
+        incidents = [{
+            "id": e.get("id", ""),
+            "names": e.get("names", []),
+            "instance": e.get("instance", ""),
+            "when": e.get("when", 0),
+        } for e in active]
+        try:
+            overlay.alarm_panel(incidents)
+        except Exception:
+            pass
+
 
 # ==============================================================
 #  Main
@@ -1303,12 +1509,29 @@ def main():
                     help="Key to toggle mute (default: page up)")
     ap.add_argument("--pause-key", default="scroll lock",
                     help="Key to pause/resume voice playback (default: scroll lock)")
+    ap.add_argument("--skip-key", default="ctrl+shift+.",
+                    help="Key to skip the current sentence and advance to the "
+                         "next (default: ctrl+shift+.)")
+    ap.add_argument("--narrate-key", default="ctrl+shift+n",
+                    help="Key to toggle tool narration on/off without "
+                         "affecting response speech (default: ctrl+shift+n)")
+    ap.add_argument("--alarm-key", default="ctrl+shift+j",
+                    help="Key to toggle the SPOKEN security alarm. The log "
+                         "and visual panel always fire (default: ctrl+shift+j)")
     ap.add_argument("--exit-key", default="ctrl+end",
                     help="Key to exit (default: ctrl+end)")
     ap.add_argument("--no-voice", action="store_true",
                     help="Disable TTS (tones only)")
+    ap.add_argument("--voice-out", action="store_true",
+                    help="Listen-only: TTS output, NO mic input — skips ASR "
+                         "load and push-to-talk entirely (implies --no-ptt)")
+    ap.add_argument("--no-ptt", action="store_true",
+                    help="Disable push-to-talk input (and skip ASR preload)")
     ap.add_argument("--no-narrate", action="store_true",
-                    help="Disable tool narration")
+                    help="Start with tool narration off (toggle: --narrate-key)")
+    ap.add_argument("--no-alarm-voice", action="store_true",
+                    help="Start with the spoken security alarm off. Incidents "
+                         "are still logged and shown on the panel.")
     ap.add_argument("--voice-vol", type=float, default=1.0)
     ap.add_argument("--tools-vol", type=float, default=0.55)
     ap.add_argument("--effects-vol", type=float, default=0.35)
@@ -1319,6 +1542,11 @@ def main():
 
     if args.key is None:
         args.key = ["page down", "insert"]
+
+    # --voice-out is listen-only: it implies no push-to-talk (which in turn
+    # skips the ASR model load entirely).
+    if args.voice_out:
+        args.no_ptt = True
 
     # ── Device selection ─────────────────────────────────────
     out_dev = None
@@ -1357,6 +1585,7 @@ def main():
         backend=args.backend,
         narrate_tools=not args.no_narrate,
         voice_enabled=not args.no_voice,
+        alarm_voice=not args.no_alarm_voice,
     )
 
     # ── Recorder ─────────────────────────────────────────────
@@ -1378,10 +1607,19 @@ def main():
     print()
     print(f"  Port        : {args.port}")
     print(f"  Backend     : {args.backend}")
-    ptt_keys_str = " / ".join(f"[{k.upper()}]" for k in args.key)
-    print(f"  Push-to-talk: {ptt_keys_str} ({args.on_key})")
+    if args.no_ptt:
+        print(f"  Push-to-talk: disabled (listen-only)")
+    else:
+        ptt_keys_str = " / ".join(f"[{k.upper()}]" for k in args.key)
+        print(f"  Push-to-talk: {ptt_keys_str} ({args.on_key})")
     print(f"  Mute toggle : [{args.mute_key.upper()}]")
     print(f"  Pause/Resume: [{args.pause_key.upper()}]")
+    print(f"  Skip        : [{args.skip_key.upper()}]")
+    print(f"  Tool narrate: [{args.narrate_key.upper()}]  "
+          f"(currently {'OFF' if args.no_narrate else 'ON'})")
+    print(f"  Alarm voice : [{args.alarm_key.upper()}]  "
+          f"(currently {'OFF' if args.no_alarm_voice else 'ON'}; "
+          f"log + panel always on)")
     print(f"  Exit        : [{args.exit_key.upper()}]")
     print(f"  Relaunch UI : [CTRL+\\]")
     print(f"  Volumes     : voice={args.voice_vol}  tools={args.tools_vol}  fx={args.effects_vol}")
@@ -1440,6 +1678,46 @@ def main():
                     registry.mute_all()
                     _kill_all_audio()
                     _broadcast_instances()
+                elif action == "set_narrate":
+                    if "enabled" in cmd:
+                        on = handler.set_narrate_tools(cmd.get("enabled"))
+                        print(f"  [Narrate] Tool announcements "
+                              f"{'ON' if on else 'OFF'}", flush=True)
+                        ov = _get_overlay()
+                        if ov:
+                            try:
+                                ov.narrate(on)
+                            except Exception:
+                                pass
+                    else:
+                        _toggle_narrate()
+                elif action == "set_alarm_voice":
+                    if "enabled" in cmd:
+                        on = handler.set_alarm_voice(cmd.get("enabled"))
+                        print(f"  [Alarm] Spoken security alarm "
+                              f"{'ON' if on else 'OFF'}", flush=True)
+                        ov = _get_overlay()
+                        if ov:
+                            try:
+                                ov.alarm_voice(on)
+                            except Exception:
+                                pass
+                    else:
+                        _toggle_alarm_voice()
+                elif action == "clear_alarm":
+                    cid = cmd.get("id", "")
+                    ok = secret_alarm_store.clear_alarm(cid)
+                    print(f"  [Security] Clear incident {cid}: "
+                          f"{'ok' if ok else 'not found'}")
+                    ov = _get_overlay()
+                    if ov:
+                        handler._push_alarm_panel(ov)
+                elif action == "clear_alarms":
+                    n = secret_alarm_store.clear_alarms()
+                    print(f"  [Security] Cleared {n} acknowledged alarm(s).")
+                    ov = _get_overlay()
+                    if ov:
+                        handler._push_alarm_panel(ov)
             except Exception:
                 pass
 
@@ -1490,8 +1768,18 @@ def main():
             def _send_init_retries():
                 for _ in range(5):
                     time.sleep(0.5)
-                    _overlay.init(**_init_payload)
+                    # Read toggle state live rather than from startup flags, so
+                    # an overlay relaunch after toggling reflects reality.
+                    _overlay.init(narrate=handler.narrate_tools,
+                                  alarm_voice=handler.alarm_voice,
+                                  **_init_payload)
                 _broadcast_instances()
+                # Re-assert the alarm panel so incidents persist across
+                # service AND overlay restarts until explicitly cleared.
+                try:
+                    handler._push_alarm_panel(_overlay)
+                except Exception:
+                    pass
             threading.Thread(target=_send_init_retries, daemon=True).start()
 
         _launch_overlay()
@@ -1505,7 +1793,10 @@ def main():
         if overlay:
             overlay.ready("whisper")
 
-    threading.Thread(target=_preload_whisper, daemon=True).start()
+    # Listen-only (--voice-out / --no-ptt) never records, so don't pay the
+    # STT model load at all.
+    if not args.no_ptt:
+        threading.Thread(target=_preload_whisper, daemon=True).start()
 
     # ── Heartbeat ────────────────────────────────────────────
     def heartbeat_thread():
@@ -1574,6 +1865,58 @@ def main():
                         overlay.paused()
             time.sleep(0.3)
 
+    def skip_key_thread():
+        import keyboard
+        while True:
+            keyboard.wait(args.skip_key, suppress=False)
+            did = handler.skip_current()
+            print(f"  [Skip] {'Skipped' if did else 'nothing to skip'}",
+                  flush=True)
+            overlay = _get_overlay()
+            if overlay:
+                overlay.skipped(did_skip=did)
+            time.sleep(0.2)  # debounce
+
+    def _toggle_narrate():
+        """Flip tool narration. Response speech is unaffected."""
+        on = handler.set_narrate_tools(not handler.narrate_tools)
+        print(f"  [Narrate] Tool announcements {'ON' if on else 'OFF'}",
+              flush=True)
+        overlay = _get_overlay()
+        if overlay:
+            try:
+                overlay.narrate(on)
+            except Exception:
+                pass
+        return on
+
+    def narrate_toggle_thread():
+        import keyboard
+        while True:
+            keyboard.wait(args.narrate_key, suppress=False)
+            _toggle_narrate()
+            time.sleep(0.3)  # debounce
+
+    def _toggle_alarm_voice():
+        """Flip the spoken security alarm. Log/record/panel always stay on."""
+        on = handler.set_alarm_voice(not handler.alarm_voice)
+        print(f"  [Alarm] Spoken security alarm {'ON' if on else 'OFF'} "
+              f"(incidents still logged + shown)", flush=True)
+        overlay = _get_overlay()
+        if overlay:
+            try:
+                overlay.alarm_voice(on)
+            except Exception:
+                pass
+        return on
+
+    def alarm_toggle_thread():
+        import keyboard
+        while True:
+            keyboard.wait(args.alarm_key, suppress=False)
+            _toggle_alarm_voice()
+            time.sleep(0.3)  # debounce
+
     def voice_thread():
         import keyboard as kb
         while True:
@@ -1629,9 +1972,17 @@ def main():
     threading.Thread(target=exit_key_thread, daemon=True).start()
     threading.Thread(target=mute_toggle_thread, daemon=True).start()
     threading.Thread(target=pause_toggle_thread, daemon=True).start()
+    # Output-only toggles — available in every mode, including listen-only.
+    threading.Thread(target=skip_key_thread, daemon=True).start()
+    threading.Thread(target=narrate_toggle_thread, daemon=True).start()
+    threading.Thread(target=alarm_toggle_thread, daemon=True).start()
     if not args.no_overlay:
         threading.Thread(target=overlay_relaunch_thread, daemon=True).start()
-    threading.Thread(target=voice_thread, daemon=True).start()
+    # Push-to-talk listener only when PTT is enabled. In listen-only mode the
+    # mic is never recorded and transcribe() is never called (which would
+    # otherwise block on loading the STT model).
+    if not args.no_ptt:
+        threading.Thread(target=voice_thread, daemon=True).start()
 
     # ── Main UDP listener ────────────────────────────────────
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

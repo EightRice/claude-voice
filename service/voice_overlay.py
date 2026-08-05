@@ -40,6 +40,8 @@ MUTED_DOT    = "#555566"   # dim
 ACTIVE_DOT   = "#ffa726"   # orange — instance is working
 ACTIVE_FG    = "#ffa726"   # orange text for active instance
 PAUSED_COLOR = "#ffee58"   # yellow — playback paused
+ALARM_BG     = "#b00020"   # deep red — security alarm panel
+ALARM_FG     = "#ff5252"   # red text — instance with outstanding alerts
 
 
 class VoiceOverlay:
@@ -112,6 +114,28 @@ class VoiceOverlay:
         self._gear.pack(side=tk.RIGHT, padx=(4, 0))
         self._gear.bind("<Button-1>", lambda e: self._toggle_settings())
 
+        # Tool-narration toggle \u2014 silences the announcer voice while leaving
+        # response speech alone. Lit = announcements on.
+        self._narrate_on = True
+        self._narrate_btn = tk.Label(row1, text="\U0001f5e3", font=("Consolas", 12),
+                                     fg=SPEAKING, bg=BG, cursor="hand2")
+        self._narrate_btn.pack(side=tk.RIGHT, padx=(4, 0))
+        self._narrate_btn.bind(
+            "<Button-1>",
+            lambda e: self._send_command(action="set_narrate",
+                                         enabled=not self._narrate_on))
+
+        # Spoken-security-alarm toggle. Silences ONLY the speech \u2014 incidents
+        # still hit the log, the durable record and the panel below.
+        self._alarm_voice_on = True
+        self._alarm_btn = tk.Label(row1, text="\U0001f514", font=("Consolas", 12),
+                                   fg=SPEAKING, bg=BG, cursor="hand2")
+        self._alarm_btn.pack(side=tk.RIGHT, padx=(4, 0))
+        self._alarm_btn.bind(
+            "<Button-1>",
+            lambda e: self._send_command(action="set_alarm_voice",
+                                         enabled=not self._alarm_voice_on))
+
         # Row 2: detail text
         self.detail_label = tk.Label(frame, text="", font=("Consolas", 9),
                                      fg=FG_DIM, bg=BG, anchor="w")
@@ -121,6 +145,15 @@ class VoiceOverlay:
         self.error_label = tk.Label(frame, text="", font=("Consolas", 9),
                                     fg=RECORDING, bg=BG, anchor="w")
         self.error_label.pack(fill=tk.X, pady=(0, 4))
+
+        # Persistent SECURITY ALARM panel — one row per incident (agent /
+        # secret names / when), newest first. Distinct from error_label: NOT
+        # cleared by any other state. Each row has an 'x' to acknowledge that
+        # incident; 'clear all' clears them together. Survives restarts (the
+        # service re-asserts the panel). Not packed until an incident exists.
+        self._incidents = []   # list of {id, names, instance, when}
+        self.alarm_panel = tk.Frame(frame, bg=ALARM_BG)
+        self._alarm_rows = []  # widgets to destroy on rebuild
 
         # Instance list
         self._instance_canvas = tk.Canvas(frame, bg=BG, highlightthickness=0,
@@ -241,7 +274,14 @@ class VoiceOverlay:
         self._instance_canvas.configure(height=canvas_h)
 
         settings_height = 100 if self._settings_visible else 0
-        total_h = self._base_h + canvas_h + settings_height
+
+        # Alarm panel height: header + one row per incident (only when shown).
+        # Without this term the panel would push the instance list off-screen.
+        alarm_row_h = 20
+        n_incidents = len(self._incidents)
+        alarm_height = (alarm_row_h * (n_incidents + 1) + 8) if n_incidents else 0
+
+        total_h = self._base_h + canvas_h + settings_height + alarm_height
 
         screen_h = self.root.winfo_screenheight()
         max_h = screen_h - 48
@@ -351,6 +391,12 @@ class VoiceOverlay:
             self._backend = msg.get("backend", "")
             self._key = msg.get("key", "")
             self._cmd_port = msg.get("cmd_port", 0)
+            # Sync the toggle buttons with the service's actual state so a
+            # --no-narrate / --no-alarm-voice start (or an overlay relaunch
+            # after toggling) isn't shown stale. Missing field defaults to ON
+            # so a dropped flag can never silently mute the alarm.
+            self._set_narrate_indicator(msg.get("narrate", True))
+            self._set_alarm_voice_indicator(msg.get("alarm_voice", True))
             devices = msg.get("devices", {})
             if devices:
                 self._populate_devices(
@@ -426,8 +472,122 @@ class VoiceOverlay:
         elif state == "error":
             self._error = msg.get("message", "Unknown error")
             self.error_label.config(text=f"\u26a0 {self._error}")
+        elif state == "skipped":
+            did = msg.get("did_skip", True)
+            label = "Skipped \u23ed" if did else "Nothing to skip"
+            color = SPEAKING if did else FG_DIM
+            self._set_state("skipped", label, color)
+            # Revert to idle shortly after, unless another state arrives first.
+            self.root.after(900, lambda: (
+                self._set_state("idle", "Idle", FG_DIM)
+                if self._state == "skipped" else None))
+        elif state == "narrate":
+            # Service is the source of truth: it echoes the resulting state
+            # whether the change came from the button or the hotkey.
+            self._set_narrate_indicator(msg.get("narrate", True))
+        elif state == "alarm_voice":
+            self._set_alarm_voice_indicator(msg.get("alarm_voice", True))
+        elif state == "alarm_panel":
+            self._render_alarm_panel(msg.get("incidents", []))
         elif state == "idle":
             self._set_state("idle", "Idle", FG_DIM)
+
+    def _fmt_when(self, when):
+        """Relative time for an incident timestamp (e.g. 'just now', '5m ago')."""
+        if not when:
+            return ""
+        try:
+            delta = max(0, int(time.time() - float(when)))
+        except (TypeError, ValueError):
+            return ""
+        if delta < 10:
+            return "just now"
+        if delta < 60:
+            return f"{delta}s ago"
+        if delta < 3600:
+            return f"{delta // 60}m ago"
+        if delta < 86400:
+            return f"{delta // 3600}h ago"
+        return f"{delta // 86400}d ago"
+
+    def _render_alarm_panel(self, incidents):
+        """Render the per-incident security panel. Newest first (service sorts).
+
+        Each row: 🚨 AGENT (bold) · secret names · relative time · [x clear].
+        A 'Clear all' link at the top clears every incident at once.
+        """
+        self._incidents = incidents or []
+        # Tear down old rows.
+        for w in self._alarm_rows:
+            w.destroy()
+        self._alarm_rows = []
+
+        if not self._incidents:
+            if self.alarm_panel.winfo_ismapped():
+                self.alarm_panel.pack_forget()
+            self._resize_window()
+            return
+
+        # Header with Clear-all.
+        header = tk.Frame(self.alarm_panel, bg=ALARM_BG)
+        header.pack(fill=tk.X, padx=4, pady=(3, 1))
+        self._alarm_rows.append(header)
+        tk.Label(header, text="\U0001f6a8 SECURITY ALARM", font=("Consolas", 10, "bold"),
+                 fg="#ffffff", bg=ALARM_BG, anchor="w").pack(side=tk.LEFT)
+        clear_all = tk.Label(header, text="clear all", font=("Consolas", 8, "underline"),
+                             fg="#ffd0d0", bg=ALARM_BG, cursor="hand2")
+        clear_all.pack(side=tk.RIGHT)
+        clear_all.bind("<Button-1>",
+                       lambda e: self._send_command(action="clear_alarms"))
+
+        # One row per incident.
+        for inc in self._incidents:
+            row = tk.Frame(self.alarm_panel, bg=ALARM_BG)
+            row.pack(fill=tk.X, padx=4, pady=1)
+            self._alarm_rows.append(row)
+
+            agent = inc.get("instance", "?") or "?"
+            names = ", ".join(inc.get("names", [])) or "?"
+            rel = self._fmt_when(inc.get("when"))
+            cid = inc.get("id", "")
+
+            close = tk.Label(row, text="✕", font=("Consolas", 9, "bold"),
+                             fg="#ffd0d0", bg=ALARM_BG, cursor="hand2")
+            close.pack(side=tk.RIGHT, padx=(4, 0))
+            close.bind("<Button-1>",
+                       lambda e, i=cid: self._send_command(action="clear_alarm", id=i))
+
+            tk.Label(row, text=agent, font=("Consolas", 9, "bold"),
+                     fg="#ffffff", bg=ALARM_BG, anchor="w").pack(side=tk.LEFT)
+            detail = f"  {names}"
+            if rel:
+                detail += f"  · {rel}"
+            tk.Label(row, text=detail, font=("Consolas", 9),
+                     fg="#ffe0e0", bg=ALARM_BG, anchor="w").pack(
+                         side=tk.LEFT, fill=tk.X, expand=True)
+
+        if not self.alarm_panel.winfo_ismapped():
+            # Place the panel just below the error row (high visual priority).
+            self.alarm_panel.pack(fill=tk.X, pady=(0, 4), after=self.error_label)
+        self._resize_window()
+
+    def _set_alarm_voice_indicator(self, on):
+        """Reflect spoken-alarm state. Bell icon swaps to a crossed bell when
+        muted, so a silenced alarm is visibly obvious rather than forgotten."""
+        self._alarm_voice_on = bool(on)
+        self._alarm_btn.config(
+            text="\U0001f514" if self._alarm_voice_on else "\U0001f515",
+            fg=SPEAKING if self._alarm_voice_on else FG_DIM)
+        self.detail_label.config(
+            text="Alarm voice ON" if self._alarm_voice_on
+            else "Alarm voice OFF (still logged + shown)")
+
+    def _set_narrate_indicator(self, on):
+        """Reflect tool-narration state on the toggle button + detail line."""
+        self._narrate_on = bool(on)
+        self._narrate_btn.config(fg=SPEAKING if self._narrate_on else FG_DIM)
+        self.detail_label.config(
+            text="Tool voice ON" if self._narrate_on else "Tool voice OFF")
 
     def _set_state(self, state, label, color):
         self._state = state
