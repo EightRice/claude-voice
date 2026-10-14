@@ -6,8 +6,9 @@ Runs independently; Claude Code instances connect via hooks.
 Provides TTS, STT, push-to-talk, tool tones, and an overlay UI.
 
 Usage:
-    python voice_service.py
-    python voice_service.py --backend edge --key "page down"
+    python voice_service.py                  # TTS out only (default: no mic/STT)
+    python voice_service.py --ptt            # also enable push-to-talk + Whisper STT
+    python voice_service.py --backend edge --key "page down" --ptt
 
 Multiple Claude instances register by sending a UDP message with their
 name, PID, and window handle.  Only one instance is unmuted at a time;
@@ -26,6 +27,7 @@ import tempfile
 import argparse
 import threading
 import queue
+import concurrent.futures
 
 # ── Platform guard ────────────────────────────────────────────
 if sys.platform != "win32":
@@ -64,6 +66,11 @@ MODELS_DIR = os.path.join(PLUGIN_DATA, "models")
 
 DEFAULT_PORT = 9111
 SENTENCE_END = re.compile(r'(?<=[.!?])\s')
+
+# Crossfade applied between sentences of a single response. Usually free (the
+# previous sentence has drained, so no fade happens at all); this value only
+# applies after a skip cut playback short, where it just avoids a click.
+INTER_SENTENCE_FADE = 0.08
 
 
 # ── Markdown / path cleaning for TTS ─────────────────────────
@@ -943,10 +950,83 @@ def _focus_window(hwnd):
 #  Transcript reading helpers
 # ==============================================================
 
+# Read this much from the end of a transcript when looking for the last turn.
+# Sized to comfortably span one assistant turn; we fall back to a full read if
+# no turn boundary is found within it.
+_TAIL_BYTES = 512 * 1024
+
+
+def _read_transcript_tail(transcript_path, max_bytes=_TAIL_BYTES):
+    """Return the last complete JSONL lines of a transcript, newest-last.
+
+    Transcripts grow to megabytes over a session, and both extractors below run
+    on every hook event - directly in the path between Claude finishing and TTS
+    starting. Reading from byte 0 makes that cost scale with session length, so
+    read only the tail.
+
+    Returns (lines, truncated) where truncated is True if the file was longer
+    than max_bytes (meaning the caller cannot assume it saw the whole session).
+    """
+    with open(transcript_path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        size = f.tell()
+        start = max(0, size - max_bytes)
+        f.seek(start)
+        blob = f.read()
+    truncated = start > 0
+    if truncated:
+        # Drop the first (probably partial) line.
+        nl = blob.find(b"\n")
+        blob = blob[nl + 1:] if nl != -1 else b""
+    text = blob.decode("utf-8", errors="replace")
+    return [ln for ln in text.splitlines() if ln.strip()], truncated
+
+
 def _extract_last_response(transcript_path):
     """Extract text from the last assistant turn (after final tool result)."""
     if not transcript_path or not os.path.exists(transcript_path):
         return ""
+    try:
+        lines, truncated = _read_transcript_tail(transcript_path)
+
+        # Walk backwards to the last turn boundary; everything after it is the
+        # current assistant turn. Equivalent to the old forward scan that reset
+        # turn_texts on each user/result event, but touches only the last turn.
+        start_idx = 0
+        found_boundary = False
+        for i in range(len(lines) - 1, -1, -1):
+            try:
+                ev = json.loads(lines[i])
+            except ValueError:
+                continue
+            if ev.get("type") in ("user", "result"):
+                start_idx = i + 1
+                found_boundary = True
+                break
+
+        # No boundary in the tail of a truncated file: the turn may start
+        # earlier than we read, so fall back to a full parse for correctness.
+        if truncated and not found_boundary:
+            return _extract_last_response_full(transcript_path)
+
+        turn_texts = []
+        for ln in lines[start_idx:]:
+            try:
+                ev = json.loads(ln)
+            except ValueError:
+                continue
+            if ev.get("type") == "assistant":
+                blocks = ev.get("message", {}).get("content", [])
+                for b in blocks:
+                    if isinstance(b, dict) and b.get("type") == "text":
+                        turn_texts.append(b.get("text", ""))
+        return " ".join(t.strip() for t in turn_texts if t.strip())
+    except Exception:
+        return ""
+
+
+def _extract_last_response_full(transcript_path):
+    """Whole-file version of _extract_last_response (rare fallback path)."""
     try:
         turn_texts = []
         with open(transcript_path, "r", encoding="utf-8") as f:
@@ -972,21 +1052,23 @@ def _extract_latest_assistant_text(transcript_path):
     if not transcript_path or not os.path.exists(transcript_path):
         return ""
     try:
-        latest_text = ""
-        with open(transcript_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                ev = json.loads(line)
-                if ev.get("type") == "assistant":
-                    blocks = ev.get("message", {}).get("content", [])
-                    for b in blocks:
-                        if isinstance(b, dict) and b.get("type") == "text":
-                            t = b.get("text", "").strip()
-                            if t:
-                                latest_text = t
-        return latest_text
+        # Only the most recent assistant text is wanted, so scan the tail
+        # backwards and stop at the first hit instead of parsing the whole file.
+        lines, _ = _read_transcript_tail(transcript_path)
+        for ln in reversed(lines):
+            try:
+                ev = json.loads(ln)
+            except ValueError:
+                continue
+            if ev.get("type") != "assistant":
+                continue
+            blocks = ev.get("message", {}).get("content", [])
+            for b in reversed(blocks):
+                if isinstance(b, dict) and b.get("type") == "text":
+                    t = b.get("text", "").strip()
+                    if t:
+                        return t
+        return ""
     except Exception:
         return ""
 
@@ -1120,6 +1202,13 @@ class EventHandler:
         self._tts_worker = threading.Thread(target=self._tts_loop, daemon=True)
         self._tts_worker.start()
 
+        # Single-threaded executor for lookahead synthesis. One worker keeps
+        # the TTS backends serialized (kokoro's ONNX session is not safe under
+        # concurrent use) while still letting sentence N+1 generate during
+        # sentence N's playback.
+        self._synth_pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="tts-synth")
+
         self._narrate_q = queue.Queue()
         self._narrate_worker = threading.Thread(target=self._narrate_loop, daemon=True)
         self._narrate_worker.start()
@@ -1172,6 +1261,13 @@ class EventHandler:
         return True
 
     def _fade_and_clear_voice(self, fade_secs=0.5):
+        """Crossfade the voice channel out, then clear it.
+
+        The fade only costs time when there is audio to fade FROM. Between
+        consecutive sentences of one response the previous sentence has
+        already drained (_wait_channel_pausable), so the sleep would be
+        pure dead air - skip it.
+        """
         if self.mixer.is_playing("voice"):
             self.mixer.fade_channel("voice", fade_secs)
             time.sleep(fade_secs)
@@ -1186,6 +1282,16 @@ class EventHandler:
             return generate_elevenlabs(text)
         else:
             return generate_edge(text)  # fallback to edge
+
+    def _synth_ahead(self, sentences, idx):
+        """Submit sentences[idx] for synthesis, or None if out of range.
+
+        Returns a Future-like object; callers use .result(). Returning None
+        for an exhausted list keeps the playback loop branch-free.
+        """
+        if idx >= len(sentences):
+            return None
+        return self._synth_pool.submit(self._generate_tts, sentences[idx])
 
     def _wait_if_paused(self):
         while self._tts_paused.is_set() and not self._tts_cancelled.is_set():
@@ -1212,19 +1318,35 @@ class EventHandler:
                 self._tts_skip.clear()
                 if is_final:
                     sentences = text_or_list if isinstance(text_or_list, list) else [text_or_list]
-                    for sentence in sentences:
+                    sentences = [x.strip() for x in sentences if x and x.strip()]
+                    # Synthesize sentence N+1 while sentence N is still playing.
+                    # Generation is the slow part; overlapping it with playback
+                    # is what removes the gaps between sentences.
+                    pending = self._synth_ahead(sentences, 0)
+                    for i in range(len(sentences)):
                         if self._tts_cancelled.is_set():
                             break
+                        # Wait if paused between sentences
                         self._wait_if_paused()
                         if self._tts_cancelled.is_set():
                             break
-                        s = sentence.strip()
-                        if not s:
-                            continue
-                        audio, sr = self._generate_tts(s)
+                        if pending is None:
+                            break
+                        try:
+                            audio, sr = pending.result()
+                        except Exception as exc:
+                            sys.stderr.write(f"[TTS error: {exc}]\n")
+                            break
                         if self._tts_cancelled.is_set():
                             break
-                        self._fade_and_clear_voice(fade_secs=0.5)
+                        # Kick off the next sentence BEFORE playing this one, so
+                        # its synthesis runs under cover of this playback.
+                        pending = self._synth_ahead(sentences, i + 1)
+                        # Normally the previous sentence has already drained, so
+                        # this is free. It only bites after an early return from
+                        # _wait_channel_pausable (skip), where a short fade is
+                        # enough to avoid a click - 0.5s would be dead air.
+                        self._fade_and_clear_voice(fade_secs=INTER_SENTENCE_FADE)
                         self.mixer.play("voice", audio, sr=sr)
                         # Returns early if skip OR cancel is set. On skip, clear
                         # the flag and fall through to the next sentence (the
@@ -1232,6 +1354,16 @@ class EventHandler:
                         self._wait_channel_pausable("voice")
                         if self._tts_skip.is_set():
                             self._tts_skip.clear()
+                    # A cancel (mute) can leave one synthesis in flight.
+                    # The pool has a single worker, so an orphaned future
+                    # would delay the NEXT response's first sentence -
+                    # drain it here instead.
+                    if pending is not None:
+                        pending.cancel()
+                        try:
+                            pending.result(timeout=5)
+                        except Exception:
+                            pass
                 else:
                     text = text_or_list if isinstance(text_or_list, str) else " ".join(text_or_list)
                     text = text.strip()
@@ -1525,8 +1657,13 @@ def main():
     ap.add_argument("--voice-out", action="store_true",
                     help="Listen-only: TTS output, NO mic input — skips ASR "
                          "load and push-to-talk entirely (implies --no-ptt)")
+    ap.add_argument("--ptt", action="store_true",
+                    help="Enable push-to-talk input (loads the Whisper STT "
+                         "model). OFF by default: Claude Code has its own "
+                         "voice input, so STT here is usually redundant.")
     ap.add_argument("--no-ptt", action="store_true",
-                    help="Disable push-to-talk input (and skip ASR preload)")
+                    help="Disable push-to-talk input (the default; kept for "
+                         "backward compatibility)")
     ap.add_argument("--no-narrate", action="store_true",
                     help="Start with tool narration off (toggle: --narrate-key)")
     ap.add_argument("--no-alarm-voice", action="store_true",
@@ -1543,10 +1680,11 @@ def main():
     if args.key is None:
         args.key = ["page down", "insert"]
 
-    # --voice-out is listen-only: it implies no push-to-talk (which in turn
-    # skips the ASR model load entirely).
-    if args.voice_out:
-        args.no_ptt = True
+    # PTT (and therefore the Whisper preload) is OPT-IN via --ptt. The
+    # default is listen-only: Claude Code has its own voice input, so loading
+    # an STT model here is usually wasted VRAM. --voice-out / --no-ptt still
+    # force it off even if --ptt was also given.
+    args.no_ptt = (not args.ptt) or args.no_ptt or args.voice_out
 
     # ── Device selection ─────────────────────────────────────
     out_dev = None
@@ -1608,7 +1746,9 @@ def main():
     print(f"  Port        : {args.port}")
     print(f"  Backend     : {args.backend}")
     if args.no_ptt:
-        print(f"  Push-to-talk: disabled (listen-only)")
+        cancel_keys = " / ".join(f"[{k.upper()}]" for k in args.key)
+        print(f"  Push-to-talk: disabled (listen-only; pass --ptt to enable)")
+        print(f"  Cancel      : {cancel_keys} (stops playback)")
     else:
         ptt_keys_str = " / ".join(f"[{k.upper()}]" for k in args.key)
         print(f"  Push-to-talk: {ptt_keys_str} ({args.on_key})")
@@ -1797,6 +1937,8 @@ def main():
     # STT model load at all.
     if not args.no_ptt:
         threading.Thread(target=_preload_whisper, daemon=True).start()
+    else:
+        print("  STT         : skipped (default; pass --ptt to load Whisper)")
 
     # ── Heartbeat ────────────────────────────────────────────
     def heartbeat_thread():
@@ -1983,6 +2125,25 @@ def main():
     # otherwise block on loading the STT model).
     if not args.no_ptt:
         threading.Thread(target=voice_thread, daemon=True).start()
+    else:
+        # Listen-only: the PTT key still CANCELS playback. With PTT on, this
+        # came for free via the recorder's on_record_start -> _kill_all_audio;
+        # with no recorder we bind the same keys straight to the cancel.
+        def cancel_key_thread():
+            import keyboard
+            for k in args.key:
+                keyboard.add_hotkey(k, _on_cancel_key, suppress=False)
+            threading.Event().wait()
+
+        def _on_cancel_key():
+            _kill_all_audio()
+            print("  [Cancel] Playback stopped", flush=True)
+            overlay = _get_overlay()
+            if overlay:
+                overlay.skipped()
+
+        threading.Thread(target=cancel_key_thread, daemon=True).start()
+
 
     # ── Main UDP listener ────────────────────────────────────
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

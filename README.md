@@ -7,7 +7,8 @@ Voice integration plugin for Claude Code. Adds text-to-speech narration, push-to
 ## Features
 
 - **TTS narration** — Claude's responses and intermediate text are read aloud
-- **Push-to-talk STT** — Hold a key to speak, transcribed via Whisper and sent to Claude
+- **Push-to-talk STT** (opt-in, `--ptt`) — Hold a key to speak, transcribed via Whisper and sent to Claude.
+  Off by default since Claude Code has its own voice input; without it the service never loads an STT model
 - **Tool tones** — Distinct audio tones for different tool types (read, edit, search, etc.)
 - **Multi-instance** — Multiple Claude sessions share one audio service; click the overlay to switch
 - **Overlay UI** — Always-on-top window showing state, instances, device selection
@@ -16,7 +17,7 @@ Voice integration plugin for Claude Code. Adds text-to-speech narration, push-to
   different voices on different channels, so you can silence the tool announcer
   and keep hearing the replies
 - **Skip a sentence** — jump to the next sentence without dropping the rest of the response
-- **Listen-only mode** — `--voice-out` gives TTS with no mic, skipping the STT model load entirely
+- **Listen-only by default** — no mic, no STT model load; pass `--ptt` to turn push-to-talk on
 - **Secret tripwire** (opt-in) — watches transcripts for real secret *values* being
   emitted raw, and raises a persistent alarm panel if one leaks
 
@@ -24,7 +25,7 @@ Voice integration plugin for Claude Code. Adds text-to-speech narration, push-to
 
 | Key | Action |
 | --- | --- |
-| `Page Down` / `Insert` | Push-to-talk (hold) |
+| `Page Down` / `Insert` | Push-to-talk (hold) with `--ptt`; otherwise stops current playback |
 | `Page Up` | Mute / unmute |
 | `Scroll Lock` | Pause / resume playback |
 | `Ctrl+Shift+.` | Skip the current sentence |
@@ -77,6 +78,7 @@ pip install -r <plugin-path>/requirements.txt
 ```
 
 Checks if the service is running, starts it if needed, and registers this Claude instance.
+Set `CLAUDE_VOICE_PTT=1` before starting to enable push-to-talk STT (loads Whisper).
 
 ### Stop the voice service
 
@@ -127,7 +129,7 @@ The voice service runs as a standalone process. Claude instances connect via UDP
 
 | Key | Action |
 |-----|--------|
-| Page Down / Insert | Push-to-talk |
+| Page Down / Insert | Push-to-talk (`--ptt`) / cancel playback |
 | Page Up | Toggle mute |
 | Scroll Lock | Pause/resume TTS |
 | Ctrl+End | Exit service |

@@ -27,8 +27,9 @@ finally:
 
 4. **If NOT running**: Start the service as a detached background process:
 ```bash
-python "${CLAUDE_PLUGIN_ROOT}/service/voice_service.py" --backend "${CLAUDE_VOICE_BACKEND:-edge}" &
+python "${CLAUDE_PLUGIN_ROOT}/service/voice_service.py" --backend "${CLAUDE_VOICE_BACKEND:-edge}" ${CLAUDE_VOICE_PTT:+--ptt} &
 ```
+Push-to-talk STT is off by default (Claude Code has its own voice input). It is enabled only when `CLAUDE_VOICE_PTT` is set, which adds `--ptt`.
 Wait 2 seconds, then verify the port is occupied (repeat the check from step 3).
 
 5. **Register this instance**: Send a register message via UDP:
@@ -43,4 +44,4 @@ print('Registered with voice service')
 "
 ```
 
-6. **Report status**: Tell the user the voice service is running and ready. Mention the push-to-talk key and that hooks are active for TTS narration.
+6. **Report status**: Tell the user the voice service is running and ready. Mention that hooks are active for TTS narration, that Page Down / Insert stops playback, and that push-to-talk STT needs `CLAUDE_VOICE_PTT=1` (or `--ptt`).
